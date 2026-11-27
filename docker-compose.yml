@@ -1,0 +1,33 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ajuste
+      POSTGRES_PASSWORD: ajuste
+      POSTGRES_DB: ajuste_fiscal
+    ports:
+      # 5432 e 5433 já estão ocupadas por outro PostgreSQL nesta máquina.
+      - "5434:5432"
+    volumes:
+      - ajuste_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ajuste -d ajuste_fiscal"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  api:
+    build: .
+    ports:
+      - "8765:8765"
+    environment:
+      DATABASE_URL: postgresql://ajuste:ajuste@postgres:5432/ajuste_fiscal
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  ajuste_pg:
