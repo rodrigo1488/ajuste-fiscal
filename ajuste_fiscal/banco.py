@@ -199,6 +199,13 @@ _COMANDOS = (
         UNIQUE (tipo, uf, regime, ncm, cest, exige_cest, vigencia_ini)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS configuracao (
+        chave text PRIMARY KEY,
+        valor text NOT NULL,
+        atualizado_em timestamptz NOT NULL DEFAULT now()
+    )
+    """,
 )
 
 _CAMPOS_VAZIOS = (
@@ -504,6 +511,37 @@ def parceiro_por_token(token: str, url: str | None = None):
             "SELECT id, nome, cnpj FROM parceiros WHERE token_hash = %s AND ativo",
             (hashlib.sha256(segredo.encode()).hexdigest(),),
         ).fetchone()
+
+
+def ler_configuracao(chave: str, url: str | None = None) -> str | None:
+    endereco = url or url_banco()
+    with conectar(endereco) as conexao:
+        garantir_schema(conexao, endereco)
+        linha = conexao.execute(
+            "SELECT valor FROM configuracao WHERE chave = %s",
+            (chave,),
+        ).fetchone()
+    return linha["valor"] if linha else None
+
+
+def gravar_configuracao(chave: str, valor: str, url: str | None = None) -> None:
+    endereco = url or url_banco()
+    texto = str(valor or "").strip()
+    with conectar(endereco) as conexao:
+        garantir_schema(conexao, endereco)
+        if texto:
+            conexao.execute(
+                """
+                INSERT INTO configuracao (chave, valor, atualizado_em)
+                VALUES (%s, %s, now())
+                ON CONFLICT (chave) DO UPDATE
+                SET valor = EXCLUDED.valor, atualizado_em = now()
+                """,
+                (chave, texto),
+            )
+        else:
+            conexao.execute("DELETE FROM configuracao WHERE chave = %s", (chave,))
+        conexao.commit()
 
 
 def limpar(url: str) -> None:

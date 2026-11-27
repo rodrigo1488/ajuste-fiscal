@@ -14,11 +14,12 @@ from ajuste_fiscal.banco import (
     consultar_ean,
     consultar_lote,
     criar_parceiro,
+    gravar_configuracao,
     listar_produtos,
     listar_sugestoes_pendentes,
     recusar_sugestao,
 )
-from ajuste_fiscal.classificar import conferir, sugerir_lote, sugerir_publico
+from ajuste_fiscal.classificar import conferir, estado_chave_gemini, sugerir_lote, sugerir_publico
 from ajuste_fiscal.saneamento import SemToken, sanear
 from ajuste_fiscal.tabelas import sincronizar
 
@@ -96,6 +97,7 @@ class Pedido(BaseHTTPRequestHandler):
                 aviso_lista=aviso_lista,
                 aba=aba,
                 acao_token=acao_token,
+                chave=estado_chave_gemini(),
             )
         )
 
@@ -115,6 +117,9 @@ class Pedido(BaseHTTPRequestHandler):
             return
         if caminho == "/parceiros":
             self._parceiro()
+            return
+        if caminho == "/configuracao":
+            self._configuracao()
             return
         if caminho == "/tabelas/atualizar":
             self._redirecionar_acao(sincronizar().como_dict())
@@ -296,6 +301,41 @@ class Pedido(BaseHTTPRequestHandler):
             traceback.print_exc()
             self._json(503, {"erro": "A base fiscal está indisponível."})
 
+    def _configuracao(self) -> None:
+        tamanho = int(self.headers.get("Content-Length", "0") or "0")
+        corpo = self.rfile.read(tamanho).decode("utf-8", errors="replace") if tamanho else ""
+        campos = parse_qs(corpo)
+        if campos.get("remover", ["0"])[0] == "1":
+            valor = ""
+            aviso = "removida"
+        else:
+            valor = campos.get("gemini_api_key", [""])[0].strip()
+            if not valor:
+                self._html(
+                    renderizar(
+                        erro="Cole a chave da API do Gemini.",
+                        aba="configuracao",
+                        chave=estado_chave_gemini(),
+                        **_contexto_base(),
+                    )
+                )
+                return
+            aviso = "salva"
+        try:
+            gravar_configuracao("gemini_api_key", valor)
+        except Exception:
+            traceback.print_exc()
+            self._html(
+                renderizar(
+                    erro="A base fiscal está indisponível.",
+                    aba="configuracao",
+                    chave={"origem": None, "sufixo": ""},
+                    **_contexto_base(),
+                )
+            )
+            return
+        self._redirecionar_acao({"configuracao": aviso}, "configuracao")
+
     def _parceiro(self) -> None:
         tamanho = int(self.headers.get("Content-Length", "0") or "0")
         corpo = self.rfile.read(tamanho).decode("utf-8", errors="replace") if tamanho else ""
@@ -439,12 +479,14 @@ def renderizar(
     aviso_lista: str | None = None,
     aba: str = "ajuste",
     acao_token: str | None = None,
+    chave: dict | None = None,
 ) -> str:
     aviso = f'<p class="erro">{html.escape(erro)}</p>' if erro else ""
     resultado = _resultado(pacote, token) if pacote else ""
     base = _base(sugestoes or [], aviso_base, resumo_base)
     catalogo = _catalogo(lista or {"itens": [], "total": 0, "pagina": 1, "paginas": 1, "busca": ""}, aviso_lista)
     abas = _abas(aba, token, acao_token)
+    configuracao = _configuracoes(chave or {}, resumo_base)
     return f"""<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -663,6 +705,7 @@ def renderizar(
     }}
     form.busca button {{ margin-top: 0; }}
     form[action="/parceiros"] {{ margin-top: 16px; }}
+    form[action="/configuracao"] input,
     form[action="/parceiros"] input {{
       padding: 12px;
       border: 1px solid #c9bfae;
@@ -741,6 +784,9 @@ def renderizar(
     <section class="aba{' ativa' if aba == 'base' else ''}">
     {base}
     </section>
+    <section class="aba{' ativa' if aba == 'configuracao' else ''}">
+    {configuracao}
+    </section>
   </main>
   <script>
     function nomeArquivo(input) {{
@@ -817,6 +863,7 @@ ABAS = (
     ("produtos", "Produtos"),
     ("consulta", "Consulta"),
     ("base", "Base"),
+    ("configuracao", "Configurações"),
 )
 
 
@@ -827,6 +874,8 @@ def _aba_ativa(pedida, pacote, resumo, busca: str) -> str:
         return "ajuste"
     if resumo and "inseridos" in resumo:
         return "importar"
+    if resumo and resumo.get("configuracao"):
+        return "configuracao"
     if resumo:
         return "base"
     if busca:
@@ -913,6 +962,49 @@ def _link_pagina(busca: str, pagina: int) -> str:
 
 def _situacao(valor) -> str:
     return {"correto": "Correto", "corrigido": "Corrigido"}.get(valor or "", valor or "")
+
+
+def _configuracoes(chave: dict, resumo: dict | None) -> str:
+    if chave.get("indisponivel"):
+        estado = '<p class="erro">A base fiscal está indisponível.</p>'
+    elif chave.get("origem") == "ambiente":
+        estado = (
+            '<p class="nota">A chave em uso veio do ambiente do servidor, '
+            f'terminada em {html.escape(chave.get("sufixo") or "")}. '
+            "Ela tem prioridade sobre a chave salva aqui.</p>"
+        )
+    elif chave.get("origem") == "base":
+        estado = (
+            '<p class="nota">Há uma chave salva nesta base, '
+            f'terminada em {html.escape(chave.get("sufixo") or "")}.</p>'
+        )
+    else:
+        estado = (
+            '<p class="nota">Nenhuma chave configurada. A conferência atualiza o texto legal, '
+            "mas não pede sugestão ao Gemini.</p>"
+        )
+    aviso = ""
+    if resumo and resumo.get("configuracao") == "salva":
+        aviso = '<p class="nota">Chave salva. Ela não aparece de novo nesta tela.</p>'
+    elif resumo and resumo.get("configuracao") == "removida":
+        aviso = '<p class="nota">Chave removida da base.</p>'
+    return (
+        "<section>"
+        "<h2>Configurações</h2>"
+        f"{aviso}{estado}"
+        '<form method="post" action="/configuracao">'
+        "<label>Chave da API do Gemini"
+        "<span>Crie em aistudio.google.com/apikey. A chave fica só na base local e não entra no Git.</span>"
+        '<input type="password" name="gemini_api_key" autocomplete="off" placeholder="Cole a chave aqui">'
+        "</label>"
+        '<button type="submit">Salvar chave</button>'
+        "</form>"
+        '<form class="linha" method="post" action="/configuracao">'
+        '<input type="hidden" name="remover" value="1">'
+        '<button class="secundario" type="submit">Remover chave salva</button>'
+        "</form>"
+        "</section>"
+    )
 
 
 def _contexto_base() -> dict:

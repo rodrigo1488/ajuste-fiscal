@@ -15,11 +15,12 @@ from ajuste_fiscal.banco import (
     conectar,
     consultar_ean,
     garantir_schema,
+    gravar_configuracao,
     limpar,
     listar_sugestoes_pendentes,
     recusar_sugestao,
 )
-from ajuste_fiscal.classificar import conferir, sugerir_lote, sugerir_publico
+from ajuste_fiscal.classificar import chave_gemini, conferir, sugerir_lote, sugerir_publico
 from ajuste_fiscal.normalizar import normalizar_texto
 from ajuste_fiscal.tabelas import sincronizar
 from app import criar_servidor
@@ -121,6 +122,7 @@ class ClassificacaoTeste(unittest.TestCase):
         os.environ["AJUSTE_GRAVAR_BASE"] = "0"
         os.environ.pop("GEMINI_API_KEY", None)
         limpar(URL_TESTE)
+        gravar_configuracao("gemini_api_key", "", URL_TESTE)
 
     def tearDown(self):
         for chave, valor in self.ambiente.items():
@@ -225,6 +227,33 @@ class ClassificacaoTeste(unittest.TestCase):
         self.assertTrue(recusar_sugestao(sugestao["id"], URL_TESTE))
         self.assertEqual(produto("REFRIGERANTE")["ncm"], "99999999")
         self.assertEqual(listar_sugestoes_pendentes(URL_TESTE), [])
+
+    def test_chave_salva_na_configuracao_passa_a_valer(self):
+        gravar_configuracao("gemini_api_key", "chave-teste-9f3a", URL_TESTE)
+        self.assertEqual(chave_gemini(), "chave-teste-9f3a")
+        os.environ["GEMINI_API_KEY"] = "ambiente"
+        self.assertEqual(chave_gemini(), "ambiente")
+        os.environ.pop("GEMINI_API_KEY", None)
+        servidor = criar_servidor(0)
+        porta = servidor.server_address[1]
+        fio = threading.Thread(target=servidor.serve_forever, daemon=True)
+        fio.start()
+        try:
+            pedido = urllib.request.Request(
+                f"http://127.0.0.1:{porta}/configuracao",
+                data=b"gemini_api_key=outra-chave-secreta-77",
+                method="POST",
+            )
+            pedido.add_header("Content-Type", "application/x-www-form-urlencoded")
+            with urllib.request.urlopen(pedido) as resposta:
+                pagina = resposta.read().decode("utf-8")
+            self.assertNotIn("outra-chave-secreta-77", pagina)
+            self.assertIn("terminada em a-77", pagina)
+            self.assertIn("Configurações", pagina)
+        finally:
+            servidor.shutdown()
+            servidor.server_close()
+            gravar_configuracao("gemini_api_key", "", URL_TESTE)
 
     def test_sem_chave_nao_chama_modelo_e_nao_troca_o_ncm(self):
         inserir("REFRIGERANTE", "99999999")

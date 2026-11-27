@@ -10,6 +10,7 @@ from ajuste_fiscal.banco import (
     atualizar_texto_legal,
     conectar,
     garantir_schema,
+    ler_configuracao,
     salvar_sugestao,
 )
 from ajuste_fiscal.normalizar import codigo_cclass, codigo_ncm, normalizar_texto
@@ -51,7 +52,26 @@ class SugestaoModelo:
 
 
 def chave_gemini() -> str:
-    return os.environ.get("GEMINI_API_KEY", "").strip()
+    ambiente = os.environ.get("GEMINI_API_KEY", "").strip()
+    if ambiente:
+        return ambiente
+    try:
+        return (ler_configuracao("gemini_api_key") or "").strip()
+    except Exception:
+        return ""
+
+
+def estado_chave_gemini() -> dict:
+    ambiente = os.environ.get("GEMINI_API_KEY", "").strip()
+    if ambiente:
+        return {"origem": "ambiente", "sufixo": ambiente[-4:]}
+    try:
+        valor = (ler_configuracao("gemini_api_key") or "").strip()
+    except Exception:
+        return {"origem": None, "sufixo": "", "indisponivel": True}
+    if valor:
+        return {"origem": "base", "sufixo": valor[-4:]}
+    return {"origem": None, "sufixo": ""}
 
 
 def modelo_gemini() -> str:
