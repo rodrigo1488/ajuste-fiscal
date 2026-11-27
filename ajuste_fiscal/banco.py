@@ -206,6 +206,39 @@ _COMANDOS = (
         atualizado_em timestamptz NOT NULL DEFAULT now()
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS saneamentos (
+        id bigserial PRIMARY KEY,
+        arquivo text,
+        lidos integer NOT NULL,
+        sanitizados integer NOT NULL,
+        conformes integer NOT NULL,
+        sem_par integer NOT NULL,
+        conflitos integer NOT NULL,
+        pendentes integer NOT NULL,
+        criado_em timestamptz NOT NULL DEFAULT now()
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cadastros (
+        id bigserial PRIMARY KEY,
+        saneamento_id bigint NOT NULL REFERENCES saneamentos (id),
+        identificador text,
+        descricao text NOT NULL,
+        ean text,
+        ncm_original text,
+        ncm text,
+        cest_original text,
+        cest text,
+        cclass_original text,
+        cclass text,
+        situacao text NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS cadastros_saneamento_idx
+        ON cadastros (saneamento_id, situacao, id)
+    """,
 )
 
 _CAMPOS_VAZIOS = (
@@ -547,7 +580,9 @@ def gravar_configuracao(chave: str, valor: str, url: str | None = None) -> None:
 def limpar(url: str) -> None:
     with conectar(url) as conexao:
         garantir_schema(conexao, url)
-        conexao.execute("TRUNCATE sugestoes, conflitos, coletas, produtos RESTART IDENTITY")
+        conexao.execute(
+            "TRUNCATE cadastros, saneamentos, sugestoes, conflitos, coletas, produtos RESTART IDENTITY"
+        )
         conexao.commit()
 
 
@@ -759,6 +794,42 @@ def _observado(planilha: PlanilhaSistema, linha) -> dict:
         "natureza_codigo": natureza_codigo,
         "natureza_descricao": natureza_descricao,
     }
+
+
+def completar_observacao(conexao, produto: dict, observado: dict, arquivo: str = "") -> None:
+    """Preenche no cadastro publicado só o que ainda estava vazio. NCM e cClassTrib não mudam."""
+    perfil = {
+        "descricao_norm": produto["descricao_norm"],
+        "descricao": produto["descricao"],
+        "ean": produto.get("ean") or observado.get("ean"),
+        "ncm": produto.get("ncm"),
+        "ncm_anterior": produto.get("ncm_anterior"),
+        "cest": produto.get("cest") or observado.get("cest"),
+        "cst_ibs_cbs": produto.get("cst_ibs_cbs"),
+        "cclass_trib": produto.get("cclass_trib"),
+        "descricao_cclass": produto.get("descricao_cclass"),
+        "reducao_cbs": produto.get("reducao_cbs"),
+        "reducao_ibs_uf": produto.get("reducao_ibs_uf"),
+        "reducao_ibs_mun": produto.get("reducao_ibs_mun"),
+        "imposto_seletivo": produto.get("imposto_seletivo"),
+        "natureza_codigo": produto.get("natureza_codigo") or observado.get("natureza_codigo"),
+        "natureza_descricao": produto.get("natureza_descricao") or observado.get("natureza_descricao"),
+        "cfop_pdv": produto.get("cfop_pdv") or observado.get("cfop_pdv"),
+        "cfop_nfe": produto.get("cfop_nfe") or observado.get("cfop_nfe"),
+        "cst_icms": produto.get("cst_icms") or observado.get("cst_icms"),
+        "csosn": produto.get("csosn") or observado.get("csosn"),
+        "cst_pis": produto.get("cst_pis") or observado.get("cst_pis"),
+        "aliq_pis": produto.get("aliq_pis") if _preenchido(produto.get("aliq_pis")) else _decimal(observado.get("aliq_pis")),
+        "cst_cofins": produto.get("cst_cofins") or observado.get("cst_cofins"),
+        "aliq_cofins": produto.get("aliq_cofins")
+        if _preenchido(produto.get("aliq_cofins"))
+        else _decimal(observado.get("aliq_cofins")),
+        "cst_ipi": produto.get("cst_ipi") or observado.get("cst_ipi"),
+        "aliq_ipi": produto.get("aliq_ipi") if _preenchido(produto.get("aliq_ipi")) else _decimal(observado.get("aliq_ipi")),
+        "situacao": produto.get("situacao") or "correto",
+        "embasamento_classificacao": produto.get("embasamento_classificacao"),
+    }
+    _gravar_um(conexao, perfil, arquivo)
 
 
 def _celula(planilha: PlanilhaSistema, linha, chave: str) -> str:
@@ -1012,6 +1083,82 @@ def listar_produtos(busca: str = "", pagina: int = 1, tamanho: int = 40, url: st
         "pagina": pagina,
         "paginas": paginas,
         "busca": busca or "",
+    }
+
+
+SITUACOES_CADASTRO = ("sanitizado", "conforme", "sem_par", "conflito", "pendente")
+
+
+def listar_cadastros(situacao: str = "sanitizado", pagina: int = 1, tamanho: int = 40, url: str | None = None) -> dict:
+    """Lista os cadastros do último CSV sanitizado."""
+    pagina = max(1, int(pagina or 1))
+    tamanho = min(max(int(tamanho or 40), 1), 100)
+    escolha = situacao if situacao in SITUACOES_CADASTRO or situacao == "todos" else "sanitizado"
+    vazio = {
+        "itens": [],
+        "total": 0,
+        "pagina": 1,
+        "paginas": 1,
+        "situacao": escolha,
+        "contagens": {chave: 0 for chave in SITUACOES_CADASTRO},
+        "arquivo": "",
+        "lidos": 0,
+        "quando": "",
+    }
+    with conectar(url) as conexao:
+        garantir_schema(conexao, url)
+        cabeca = conexao.execute(
+            "SELECT * FROM saneamentos ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if cabeca is None:
+            return vazio
+        contagens = {chave: 0 for chave in SITUACOES_CADASTRO}
+        for linha in conexao.execute(
+            """
+            SELECT situacao, count(*) AS n
+            FROM cadastros
+            WHERE saneamento_id = %s
+            GROUP BY situacao
+            """,
+            (cabeca["id"],),
+        ).fetchall():
+            if linha["situacao"] in contagens:
+                contagens[linha["situacao"]] = linha["n"]
+        filtro = "WHERE saneamento_id = %s"
+        parametros: list = [cabeca["id"]]
+        if escolha != "todos":
+            filtro += " AND situacao = %s"
+            parametros.append(escolha)
+        total = conexao.execute(
+            f"SELECT count(*) AS n FROM cadastros {filtro}",
+            parametros,
+        ).fetchone()["n"]
+        paginas = max(1, (total + tamanho - 1) // tamanho)
+        if pagina > paginas:
+            pagina = paginas
+        linhas = conexao.execute(
+            f"""
+            SELECT identificador, descricao, ean, ncm_original, ncm, cest_original, cest,
+                   cclass_original, cclass, situacao
+            FROM cadastros
+            {filtro}
+            ORDER BY id
+            LIMIT %s OFFSET %s
+            """,
+            [*parametros, tamanho, (pagina - 1) * tamanho],
+        ).fetchall()
+    quando = cabeca["criado_em"]
+    texto_quando = quando.strftime("%d/%m/%Y %H:%M") if hasattr(quando, "strftime") else ""
+    return {
+        "itens": [dict(linha) for linha in linhas],
+        "total": total,
+        "pagina": pagina,
+        "paginas": paginas,
+        "situacao": escolha,
+        "contagens": contagens,
+        "arquivo": cabeca["arquivo"] or "",
+        "lidos": cabeca["lidos"],
+        "quando": texto_quando,
     }
 
 

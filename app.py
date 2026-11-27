@@ -15,12 +15,15 @@ from ajuste_fiscal.banco import (
     consultar_lote,
     criar_parceiro,
     gravar_configuracao,
+    SITUACOES_CADASTRO,
+    listar_cadastros,
     listar_produtos,
     listar_sugestoes_pendentes,
     recusar_sugestao,
 )
 from ajuste_fiscal.classificar import conferir, estado_chave_gemini, sugerir_lote, sugerir_publico
 from ajuste_fiscal.saneamento import SemToken, sanear
+from ajuste_fiscal.sanitizar import sanitizar_csv
 from ajuste_fiscal.tabelas import sincronizar
 
 HOST = "0.0.0.0"
@@ -85,6 +88,13 @@ class Pedido(BaseHTTPRequestHandler):
         except Exception:
             lista = {"itens": [], "total": 0, "pagina": 1, "paginas": 1, "busca": busca}
             aviso_lista = "A base fiscal está indisponível."
+        situacao = consulta.get("situacao", ["sanitizado"])[0]
+        try:
+            cadastros = listar_cadastros(situacao, numero_pagina)
+            aviso_cadastros = None
+        except Exception:
+            cadastros = _cadastros_vazios(situacao)
+            aviso_cadastros = "A base fiscal está indisponível."
         aba = _aba_ativa(consulta.get("aba", [None])[0], pacote, acao, busca)
         self._html(
             renderizar(
@@ -95,6 +105,8 @@ class Pedido(BaseHTTPRequestHandler):
                 resumo_base=acao,
                 lista=lista,
                 aviso_lista=aviso_lista,
+                cadastros=cadastros,
+                aviso_cadastros=aviso_cadastros,
                 aba=aba,
                 acao_token=acao_token,
                 chave=estado_chave_gemini(),
@@ -193,7 +205,7 @@ class Pedido(BaseHTTPRequestHandler):
         if caminho.path.endswith("/csv"):
             conteudo = pacote["csv"]
             tipo = f"text/csv; charset={pacote['charset']}"
-            nome = "estoque-ajustado.csv"
+            nome = "estoque-sanitizado.csv" if pacote.get("tipo") == "sanitizacao" else "estoque-ajustado.csv"
         else:
             conteudo = pacote["relatorio"]
             tipo = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -208,24 +220,51 @@ class Pedido(BaseHTTPRequestHandler):
     def _importar(self) -> None:
         tamanho = int(self.headers.get("Content-Length", "0") or "0")
         if tamanho <= 0 or tamanho > LIMITE_BYTES:
-            self._html(renderizar(erro="Escolha a planilha ou o laudo para importar."))
+            self._html(renderizar(erro="Escolha a planilha, o laudo ou o CSV do sistema.", aba="importar"))
             return
         try:
             arquivos = ler_multipart(self.headers.get("Content-Type", ""), self.rfile.read(tamanho))
+            sistema = arquivos.get("sistema")
+            if sistema and sistema[1]:
+                self._sanitizar(sistema)
+                return
             arquivo = arquivos.get("produtos")
             if not arquivo or not arquivo[1]:
-                raise ValueError("Escolha a planilha com a aba Importacao ou o laudo em PDF.")
+                raise ValueError("Escolha a planilha com a aba Importacao, o laudo em PDF ou o CSV do sistema.")
             from io import BytesIO
 
             resumo = importar_para_base(BytesIO(arquivo[1]), nome_arquivo=arquivo[0])
         except ValueError as exc:
-            self._html(renderizar(erro=str(exc)))
+            self._html(renderizar(erro=str(exc), aba="importar"))
             return
         except Exception:
             traceback.print_exc()
-            self._html(renderizar(erro="Falha ao importar os produtos para a base."))
+            self._html(renderizar(erro="Falha ao importar os produtos para a base.", aba="importar"))
             return
         self._redirecionar_acao(resumo.como_dict(), "importar")
+
+    def _sanitizar(self, arquivo: tuple[str, bytes]) -> None:
+        try:
+            resultado = sanitizar_csv(arquivo[1], arquivo[0])
+        except ValueError as exc:
+            self._html(renderizar(erro=str(exc), aba="importar"))
+            return
+        except Exception:
+            traceback.print_exc()
+            self._html(renderizar(erro="Falha ao sanitizar o CSV do sistema.", aba="importar"))
+            return
+        token = uuid.uuid4().hex
+        RESULTADOS[token] = {
+            "tipo": "sanitizacao",
+            "csv": resultado.csv_bytes,
+            "charset": resultado.charset,
+        }
+        while len(RESULTADOS) > MAX_RESULTADOS:
+            RESULTADOS.pop(next(iter(RESULTADOS)))
+        self.send_response(303)
+        self.send_header("Location", f"/?id={token}&aba=importar&situacao=sanitizado")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _sugerir(self) -> None:
         tamanho = int(self.headers.get("Content-Length", "0") or "0")
@@ -477,14 +516,17 @@ def renderizar(
     resumo_base: dict | None = None,
     lista: dict | None = None,
     aviso_lista: str | None = None,
+    cadastros: dict | None = None,
+    aviso_cadastros: str | None = None,
     aba: str = "ajuste",
     acao_token: str | None = None,
     chave: dict | None = None,
 ) -> str:
     aviso = f'<p class="erro">{html.escape(erro)}</p>' if erro else ""
-    resultado = _resultado(pacote, token) if pacote else ""
+    resultado = _resultado(pacote, token) if pacote and pacote.get("tipo") != "sanitizacao" else ""
     base = _base(sugestoes or [], aviso_base, resumo_base)
     catalogo = _catalogo(lista or {"itens": [], "total": 0, "pagina": 1, "paginas": 1, "busca": ""}, aviso_lista)
+    sanitizados = _sanitizados(cadastros or _cadastros_vazios(), aviso_cadastros, pacote, token, acao_token)
     abas = _abas(aba, token, acao_token)
     configuracao = _configuracoes(chave or {}, resumo_base)
     return f"""<!DOCTYPE html>
@@ -722,6 +764,67 @@ def renderizar(
       color: var(--verde-escuro);
       font-weight: 650;
     }}
+    .filtros {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 8px 0 16px;
+    }}
+    .filtros a {{
+      color: var(--tinta);
+      text-decoration: none;
+      border: 1px solid var(--linha);
+      background: var(--card);
+      border-radius: 999px;
+      padding: 8px 14px;
+      font-weight: 650;
+    }}
+    .filtros a.ativa {{
+      background: var(--verde);
+      color: white;
+      border-color: var(--verde);
+    }}
+    tr.sanitizado td {{ background: #f3faf6; }}
+    .carregando {{
+      position: fixed;
+      inset: 0;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(28, 25, 21, 0.45);
+      padding: 20px;
+    }}
+    .carregando[hidden] {{ display: none !important; }}
+    .carregando .cartao {{
+      width: min(420px, 100%);
+      background: var(--card);
+      border-radius: 16px;
+      padding: 28px 32px;
+      text-align: center;
+    }}
+    .carregando strong {{
+      display: block;
+      font-size: 1.25rem;
+      margin-bottom: 6px;
+    }}
+    .carregando p {{
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.45;
+    }}
+    .giro {{
+      width: 36px;
+      height: 36px;
+      margin: 0 auto 14px;
+      border: 3px solid var(--linha);
+      border-top-color: var(--verde);
+      border-radius: 50%;
+      animation: girar 0.8s linear infinite;
+    }}
+    @keyframes girar {{
+      to {{ transform: rotate(360deg); }}
+    }}
   </style>
 </head>
 <body>
@@ -731,7 +834,7 @@ def renderizar(
     {aviso}
     {abas}
     <section class="aba{' ativa' if aba == 'ajuste' else ''}">
-    <form action="/processar" method="post" enctype="multipart/form-data">
+    <form action="/processar" method="post" enctype="multipart/form-data" data-carregando="Gerando o CSV de importação…">
       <div class="campos">
         <label>Planilha ou laudo
           <span>Arquivo .xlsx com a aba Produtos auditados, ou o laudo em PDF.</span>
@@ -755,10 +858,10 @@ def renderizar(
     {resultado}
     </section>
     <section class="aba{' ativa' if aba == 'importar' else ''}">
-    <form action="/importar" method="post" enctype="multipart/form-data">
+    <form action="/importar" method="post" enctype="multipart/form-data" data-carregando="Importando os produtos para a base…">
       <div class="campos">
         <label>Importar para a base
-          <span>Aba Importacao, aba Produtos auditados ou laudo em PDF. Entram só Correto e Incorreto, sem o CSV do sistema.</span>
+          <span>Aba Importacao, aba Produtos auditados ou laudo em PDF. Entram só Correto e Incorreto.</span>
           <span class="escolha">
             <input type="file" name="produtos" accept=".xlsx,.pdf,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required onchange="nomeArquivo(this)">
             <span class="botao">Escolher arquivo</span>
@@ -768,6 +871,20 @@ def renderizar(
       </div>
       <button type="submit">Importar produtos</button>
     </form>
+    <form action="/importar" method="post" enctype="multipart/form-data" data-carregando="Lendo o CSV e sanitizando os cadastros…">
+      <div class="campos">
+        <label>CSV do sistema
+          <span>Exportação separada por |. O NCM, o CEST e o cClassTrib confirmados na base voltam para o arquivo. EAN, CFOP e CST que a base ainda não tinha sobem para o cadastro. Quem não está na base fica na fila de conferência.</span>
+          <span class="escolha">
+            <input type="file" name="sistema" accept=".csv,text/csv" required onchange="nomeArquivo(this)">
+            <span class="botao">Escolher arquivo</span>
+            <span class="nome">Nenhum arquivo escolhido</span>
+          </span>
+        </label>
+      </div>
+      <button type="submit">Sanitizar cadastros</button>
+    </form>
+    {sanitizados}
     </section>
     <section class="aba{' ativa' if aba == 'produtos' else ''}">
     {catalogo}
@@ -788,11 +905,28 @@ def renderizar(
     {configuracao}
     </section>
   </main>
+  <div id="carregando" class="carregando" hidden>
+    <div class="cartao" role="status" aria-live="polite">
+      <div class="giro"></div>
+      <strong>Aguarde</strong>
+      <p id="carregando-texto">Processando…</p>
+    </div>
+  </div>
   <script>
     function nomeArquivo(input) {{
       var nome = input.parentElement.querySelector(".nome");
       nome.textContent = input.files.length ? input.files[0].name : "Nenhum arquivo escolhido";
     }}
+    document.querySelectorAll("form").forEach(function (form) {{
+      form.addEventListener("submit", function () {{
+        if ((form.getAttribute("method") || "").toLowerCase() !== "post") return;
+        var painel = document.getElementById("carregando");
+        var texto = document.getElementById("carregando-texto");
+        if (texto) texto.textContent = form.getAttribute("data-carregando") || "Processando…";
+        if (painel) painel.hidden = false;
+        form.querySelectorAll("button").forEach(function (botao) {{ botao.disabled = true; }});
+      }});
+    }});
     function abrirEan(evento) {{
       evento.preventDefault();
       var codigo = (evento.target.ean.value || "").replace(/\\D/g, "");
@@ -870,6 +1004,8 @@ ABAS = (
 def _aba_ativa(pedida, pacote, resumo, busca: str) -> str:
     if pedida in {chave for chave, _rotulo in ABAS}:
         return pedida
+    if pacote and pacote.get("tipo") == "sanitizacao":
+        return "importar"
     if pacote:
         return "ajuste"
     if resumo and "inseridos" in resumo:
@@ -964,6 +1100,131 @@ def _situacao(valor) -> str:
     return {"correto": "Correto", "corrigido": "Corrigido"}.get(valor or "", valor or "")
 
 
+_FILTROS_CADASTRO = (
+    ("sanitizado", "Sanitizados"),
+    ("conforme", "Já conformes"),
+    ("sem_par", "Sem cadastro"),
+    ("conflito", "Conflitos"),
+    ("pendente", "Pendentes"),
+    ("todos", "Todos"),
+)
+_ROTULOS_CADASTRO = {
+    "sanitizado": "Sanitizado",
+    "conforme": "Já conforme",
+    "sem_par": "Sem cadastro",
+    "conflito": "Conflito",
+    "pendente": "Pendente",
+}
+
+
+def _cadastros_vazios(situacao: str = "sanitizado") -> dict:
+    escolha = situacao if situacao in SITUACOES_CADASTRO or situacao == "todos" else "sanitizado"
+    return {
+        "itens": [],
+        "total": 0,
+        "pagina": 1,
+        "paginas": 1,
+        "situacao": escolha,
+        "contagens": {chave: 0 for chave in SITUACOES_CADASTRO},
+        "arquivo": "",
+        "lidos": 0,
+        "quando": "",
+    }
+
+
+def _sanitizados(cadastros: dict, aviso: str | None, pacote: dict | None, token: str | None, acao_token: str | None) -> str:
+    aviso_html = f'<p class="erro">{html.escape(aviso)}</p>' if aviso else ""
+    contagens = cadastros.get("contagens") or {}
+    chips = []
+    for chave, rotulo in _FILTROS_CADASTRO:
+        classe = ' class="ativa"' if cadastros.get("situacao") == chave else ""
+        quantidade = sum(contagens.values()) if chave == "todos" else contagens.get(chave, 0)
+        endereco = html.escape(_link_cadastro(chave, 1, token, acao_token))
+        chips.append(f'<a href="{endereco}"{classe}>{html.escape(rotulo)} ({quantidade})</a>')
+    arquivo = cadastros.get("arquivo") or ""
+    if arquivo:
+        quando = f" em {cadastros['quando']}" if cadastros.get("quando") else ""
+        lidos = cadastros.get("lidos") or 0
+        resumo = f'<p class="nota">Último CSV: {html.escape(arquivo)}{html.escape(quando)}. {lidos} produtos lidos.</p>'
+    else:
+        resumo = '<p class="nota">Nenhum CSV do sistema foi sanitizado ainda.</p>'
+    baixar = ""
+    if token and pacote and pacote.get("tipo") == "sanitizacao":
+        baixar = (
+            '<div class="acoes">'
+            f'<a href="/baixar/csv?id={html.escape(token)}">Baixar CSV sanitizado</a>'
+            "</div>"
+        )
+    linhas = []
+    for item in cadastros.get("itens") or []:
+        situacao = item.get("situacao") or ""
+        classe = ' class="sanitizado"' if situacao == "sanitizado" else ""
+        linhas.append(
+            f"<tr{classe}>"
+            f"<td>{html.escape(item.get('identificador') or '')}</td>"
+            f"<td>{html.escape(item.get('descricao') or '')}</td>"
+            f"<td><code>{html.escape(item.get('ean') or '')}</code></td>"
+            f"<td>{_seta(item.get('ncm_original'), item.get('ncm'))}</td>"
+            f"<td>{_seta(item.get('cest_original'), item.get('cest'))}</td>"
+            f"<td>{_seta(item.get('cclass_original'), item.get('cclass'))}</td>"
+            f"<td>{html.escape(_ROTULOS_CADASTRO.get(situacao, situacao))}</td>"
+            "</tr>"
+        )
+    if linhas:
+        tabela = (
+            '<div class="painel"><table><thead><tr>'
+            "<th>Código</th><th>Descrição</th><th>EAN</th><th>NCM</th><th>CEST</th>"
+            "<th>cClassTrib</th><th>Situação</th>"
+            "</tr></thead><tbody>"
+            + "".join(linhas)
+            + "</tbody></table></div>"
+        )
+    elif arquivo:
+        tabela = '<p class="nota">Nenhum cadastro neste filtro.</p>'
+    else:
+        tabela = '<p class="nota">Envie o CSV do sistema para ver os cadastros sanitizados.</p>'
+    paginas = ""
+    if cadastros.get("paginas", 1) > 1:
+        situacao = cadastros.get("situacao") or "sanitizado"
+        anterior = _link_cadastro(situacao, cadastros["pagina"] - 1, token, acao_token) if cadastros["pagina"] > 1 else ""
+        seguinte = (
+            _link_cadastro(situacao, cadastros["pagina"] + 1, token, acao_token)
+            if cadastros["pagina"] < cadastros["paginas"]
+            else ""
+        )
+        paginas = (
+            '<p class="paginas">'
+            + (f'<a href="{html.escape(anterior)}">Anterior</a>' if anterior else "")
+            + f'<span>Página {cadastros["pagina"]} de {cadastros["paginas"]}</span>'
+            + (f'<a href="{html.escape(seguinte)}">Próxima</a>' if seguinte else "")
+            + "</p>"
+        )
+    return (
+        "<h2>Cadastros sanitizados</h2>"
+        f"{aviso_html}{resumo}{baixar}"
+        f'<nav class="filtros">{"".join(chips)}</nav>'
+        + tabela
+        + paginas
+    )
+
+
+def _seta(antes, depois) -> str:
+    origem = antes or ""
+    destino = depois or ""
+    if origem == destino:
+        return f"<code>{html.escape(origem)}</code>" if origem else ""
+    return f"<code>{html.escape(origem)}</code> → <code>{html.escape(destino)}</code>"
+
+
+def _link_cadastro(situacao: str, pagina: int, token: str | None, acao_token: str | None) -> str:
+    partes = ["aba=importar", f"situacao={quote(situacao)}", f"pagina={pagina}"]
+    if token:
+        partes.append(f"id={quote(token)}")
+    if acao_token:
+        partes.append(f"acao={quote(acao_token)}")
+    return "/?" + "&".join(partes)
+
+
 def _configuracoes(chave: dict, resumo: dict | None) -> str:
     if chave.get("indisponivel"):
         estado = '<p class="erro">A base fiscal está indisponível.</p>'
@@ -992,14 +1253,14 @@ def _configuracoes(chave: dict, resumo: dict | None) -> str:
         "<section>"
         "<h2>Configurações</h2>"
         f"{aviso}{estado}"
-        '<form method="post" action="/configuracao">'
+        '<form method="post" action="/configuracao" data-carregando="Salvando a configuração…">'
         "<label>Chave da API do Gemini"
         "<span>Crie em aistudio.google.com/apikey. A chave fica só na base local e não entra no Git.</span>"
         '<input type="password" name="gemini_api_key" autocomplete="off" placeholder="Cole a chave aqui">'
         "</label>"
         '<button type="submit">Salvar chave</button>'
         "</form>"
-        '<form class="linha" method="post" action="/configuracao">'
+        '<form class="linha" method="post" action="/configuracao" data-carregando="Removendo a chave salva…">'
         '<input type="hidden" name="remover" value="1">'
         '<button class="secundario" type="submit">Remover chave salva</button>'
         "</form>"
@@ -1066,10 +1327,10 @@ def _base(sugestoes: list, aviso_base: str | None, resumo: dict | None) -> str:
             f"<td>{html.escape(duvida)}</td>"
             f"<td>{html.escape(analise)}</td>"
             "<td>"
-            f'<form class="linha" method="post" action="/sugestoes/aceitar">'
+            f'<form class="linha" method="post" action="/sugestoes/aceitar" data-carregando="Atualizando a sugestão…">'
             f'<input type="hidden" name="id" value="{int(item["id"])}">'
             '<button type="submit">Aceitar</button></form> '
-            f'<form class="linha" method="post" action="/sugestoes/recusar">'
+            f'<form class="linha" method="post" action="/sugestoes/recusar" data-carregando="Atualizando a sugestão…">'
             f'<input type="hidden" name="id" value="{int(item["id"])}">'
             '<button class="secundario" type="submit">Recusar</button></form>'
             "</td></tr>"
@@ -1094,10 +1355,10 @@ def _base(sugestoes: list, aviso_base: str | None, resumo: dict | None) -> str:
         "O cadastro publicado só muda ao aceitar a sugestão.</p>"
         f"{aviso}{blocos}"
         '<div class="acoes">'
-        '<form class="linha" method="post" action="/tabelas/atualizar"><button type="submit">Atualizar tabelas oficiais</button></form>'
-        '<form class="linha" method="post" action="/cadastros/conferir"><button type="submit">Conferir cadastros</button></form>'
+        '<form class="linha" method="post" action="/tabelas/atualizar" data-carregando="Atualizando as tabelas oficiais…"><button type="submit">Atualizar tabelas oficiais</button></form>'
+        '<form class="linha" method="post" action="/cadastros/conferir" data-carregando="Conferindo os cadastros…"><button type="submit">Conferir cadastros</button></form>'
         "</div>"
-        '<form method="post" action="/parceiros">'
+        '<form method="post" action="/parceiros" data-carregando="Emitindo o token do parceiro…">'
         '<div class="campos">'
         "<label>Parceiro ERP"
         "<span>Emite um token para o POST /v1/saneamento. O token aparece uma vez.</span>"
